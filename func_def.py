@@ -302,88 +302,156 @@ def LC_HC_diverse(embed_model, remainder, n, low_conf_ratio=0.5, high_conf_ratio
 
 #     return exp_acc
 
-# add fixed 5% of total data size-> 
 def train_until_empty(model, initial_train_set, remainder_set, test_set,
                       epochs=50, max_iterations=20, batch_size=32,
-                      learning_rate=0.01, method=1):
+                      learning_rate=0.01, method=1, run_tag='lcd'):
+    
     import numpy as np
     from torch.utils import data
+    import csv
+    import os
 
     exp_acc = []
 
-    # Reference to original dataset (e.g., CIFAR-10)
     original_dataset = remainder_set.dataset
     total_data_size = len(original_dataset)
 
-    # Track train indices explicitly
+  
     if hasattr(initial_train_set, 'indices'):
-        train_indices = set(initial_train_set.indices)
+        initial_indices = list(initial_train_set.indices)
     else:
         raise ValueError("initial_train_set must be a Subset with indices.")
 
-    # Get remainder indices and ensure no overlap
-    remainder_indices = set(remainder_set.indices) - train_indices
+    # remainder indices
+    if hasattr(remainder_set, 'indices'):
+        all_remainder_indices = list(remainder_set.indices)
+    else:
+        all_remainder_indices = list(range(len(original_dataset)))
+        all_remainder_indices = [i for i in all_remainder_indices if i not in initial_indices]
 
-    # Create availability mask (True if sample is still in remainder)
-    available_mask = np.ones(len(original_dataset), dtype=bool)
-    available_mask[list(train_indices)] = False
+   
+    available_mask = np.zeros(len(original_dataset), dtype=bool)
+    available_mask[all_remainder_indices] = True
 
-    # Fixed number of samples per iteration
     fixed_sample_size = int(0.05 * total_data_size)
 
-    for iteration in range(max_iterations):
+
+    iter_csv = f"time_iter_log_{run_tag}.csv"
+    epoch_csv = f"time_epoch_log_{run_tag}.csv"
+    if not os.path.exists(iter_csv):
+        with open(iter_csv, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['method','iteration','train_size_new_samples','remainder_size_after_selection','iteration_time_s','avg_epoch_time_s','total_epoch_time_s','avg_epoch_loss','test_acc'])
+    if not os.path.exists(epoch_csv):
+        with open(epoch_csv, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(['method','iteration','epoch','epoch_time_s','epoch_loss','trained_on']) # trained_on indicates 'initial' or 'new'
+
+    # ----------------- INITIAL TRAINING ON initial_train_set -----------------
+    print(">>> Initial training on initial labeled set only")
+    if len(initial_indices) > 0:
+        init_loader = data.DataLoader(initial_train_set, batch_size=batch_size, shuffle=True)
+        init_epoch_losses, init_epoch_times = train_model(model, init_loader, epochs=epochs, learning_rate=learning_rate)
+        test_loader = data.DataLoader(test_set, batch_size=batch_size)
+        initial_acc = test_model(model, test_loader)
+        print(f"Initial training done. Initial test accuracy: {initial_acc:.6f}")
+        with open(iter_csv, 'a', newline='') as f:
+            w = csv.writer(f)
+            w.writerow([f"method_{method}", 0, len(initial_indices), (available_mask.sum()),  sum(init_epoch_times)+0.0, np.mean(init_epoch_times) if len(init_epoch_times)>0 else 0.0, sum(init_epoch_times), (sum(init_epoch_losses)/len(init_epoch_losses) if len(init_epoch_losses)>0 else 0.0), f"{initial_acc:.6f}"])
+        with open(epoch_csv, 'a', newline='') as f:
+            w = csv.writer(f)
+            for ei, (et, el) in enumerate(zip(init_epoch_times, init_epoch_losses), start=1):
+                w.writerow([f"method_{method}", 0, ei, f"{et:.4f}", f"{el:.6f}", "initial"])
+    else:
+        print("No initial labeled indices provided; skipping initial training.")
+
+    # ----------------- training only on NEW samples each iteration -----------------
+    for iteration in range(1, max_iterations+1):
         current_remainder_indices = np.where(available_mask)[0]
         if len(current_remainder_indices) == 0:
             print("Dataset empty. Stopping.")
             break
 
         current_remainder = data.Subset(original_dataset, current_remainder_indices)
-        print(f"\nStarting Iteration {iteration + 1}")
-        print(f"Remainder Size: {len(current_remainder)}")
+        print(f"\nStarting Iteration {iteration}")
+        print(f"Remainder Size (before selection): {len(current_remainder)}")
 
-        # Decide how many samples to pick
+        # determine selection
         if len(current_remainder) <= fixed_sample_size:
             print("Less than fixed sample size left. Taking all remaining samples.")
             relative_indices = list(range(len(current_remainder)))
-            train_data = data.Subset(current_remainder.dataset,
-                                     [current_remainder_indices[i] for i in relative_indices])
+            absolute_selected = [current_remainder_indices[i] for i in relative_indices]
+            samples_to_add = data.Subset(original_dataset, absolute_selected)
         else:
-            # Apply selection method
             if method == 1:
-                train_data, relative_indices = LC_HC(model, current_remainder, n=fixed_sample_size)
+                train_data_subset, relative_indices = LC_HC(model, current_remainder, n=fixed_sample_size)
             elif method == 2:
-                train_data, relative_indices = LC_HC_diverse(model, current_remainder, n=fixed_sample_size)
+                train_data_subset, relative_indices = LC_HC_diverse(model, current_remainder, n=fixed_sample_size)
             elif method == 3:
-                train_data, relative_indices = HC_diverse(model, current_remainder, n=fixed_sample_size)
+                train_data_subset, relative_indices = HC_diverse(model, current_remainder, n=fixed_sample_size)
             elif method == 4:
-                train_data, relative_indices = LC_diverse(model, current_remainder, n=fixed_sample_size)
+                train_data_subset, relative_indices = LC_diverse(model, current_remainder, n=fixed_sample_size)
             else:
                 print("Invalid method.")
                 return exp_acc
 
-        # Convert relative to absolute indices
-        absolute_indices = [current_remainder_indices[i] for i in relative_indices]
-        available_mask[absolute_indices] = False
+            absolute_selected = [current_remainder_indices[i] for i in relative_indices]
+            samples_to_add = data.Subset(original_dataset, absolute_selected)
 
-        # Update training set
-        samples_to_add = data.Subset(original_dataset, absolute_indices)
-        all_train_indices = list(train_indices) + absolute_indices
-        train_indices.update(absolute_indices)
-        initial_train_set = data.Subset(original_dataset, all_train_indices)
+       
+        available_mask[absolute_selected] = False
 
-        # Print and train
-        print(f"Train Size: {len(initial_train_set)}, Remainder Size: {len(current_remainder) - len(absolute_indices)}")
+       
+        new_train_size = len(absolute_selected)
+        remainder_after = int(available_mask.sum())
 
-        train_loader = data.DataLoader(initial_train_set, batch_size=batch_size, shuffle=True)
-        train_model(model, train_loader, epochs=epochs, learning_rate=learning_rate)
+        print(f"New samples selected this iteration: {new_train_size}")
+        print(f"Remainder Size (after selection): {remainder_after}")
 
+        # ------------------ TIMING: train ONLY on samples_to_add ------------------------
+        iter_start = time.time()
+
+        if new_train_size == 0:
+            print("No new samples selected this iteration, skipping training.")
+            test_loader = data.DataLoader(test_set, batch_size=batch_size)
+            acc = test_model(model, test_loader)
+            exp_acc.append(acc)
+            with open(iter_csv, 'a', newline='') as f:
+                w = csv.writer(f)
+                w.writerow([f"method_{method}", iteration, new_train_size, remainder_after, 0.0, 0.0, 0.0, 0.0, f"{acc:.6f}"])
+            continue
+
+        train_loader_new = data.DataLoader(samples_to_add, batch_size=batch_size, shuffle=True)
+
+        epoch_losses, epoch_times = train_model(model, train_loader_new, epochs=epochs, learning_rate=learning_rate)
+
+        # test
         test_loader = data.DataLoader(test_set, batch_size=batch_size)
         accuracy = test_model(model, test_loader)
+
+        iter_end = time.time()
+
+        iteration_time = iter_end - iter_start
+        total_epoch_time = sum(epoch_times)
+        avg_epoch_time = total_epoch_time / len(epoch_times) if len(epoch_times)>0 else 0.0
+        avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if len(epoch_losses)>0 else 0.0
+
+        # Write iteration-level row
+        with open(iter_csv, 'a', newline='') as f:
+            w = csv.writer(f)
+            w.writerow([f"method_{method}", iteration, new_train_size, remainder_after, f"{iteration_time:.4f}", f"{avg_epoch_time:.4f}", f"{total_epoch_time:.4f}", f"{avg_epoch_loss:.6f}", f"{accuracy:.6f}"])
+
+        # Write epoch-level rows (trained_on='new'):
+        with open(epoch_csv, 'a', newline='') as f:
+            w = csv.writer(f)
+            for ei, (et, el) in enumerate(zip(epoch_times, epoch_losses), start=1):
+                w.writerow([f"method_{method}", iteration, ei, f"{et:.4f}", f"{el:.6f}", "new"])
+
         exp_acc.append(accuracy)
-        print(f"Iteration {iteration + 1} Accuracy: {accuracy}")
+        print(f"Iteration {iteration} Accuracy: {accuracy}")
 
     return exp_acc
-
+                          
 def run_all_methods(model, initial_train_set, remainder, test_set):
     methods = [1, 2, 3, 4]
     results = {}
