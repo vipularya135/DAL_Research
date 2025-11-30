@@ -5,7 +5,7 @@
 --
 ## Experiments Performed
 
-We conducted experiments using the following models and methods:
+We will conducted experiments using the following models and methods:
 
 1. **Models:**
    - VGG-16
@@ -26,11 +26,7 @@ We conducted experiments using the following models and methods:
 
 3. **Experiment Details:**
    - We train our model initially on 4% of total data samples.
-   - Then we use one of the 4 methods to select the next 5% samples to train the model for each iteration:
-     1. Method 1: top 5k samples that are diverse low and diverse high confidence.
-     2. Method 2: top 5k samples that are diverse and high confidence.
-     3. Method 3: top 5k samples that are diverse and low confidence.
-     4. Method 4: top 5k samples that are low and high confidence.
+   - Then we use one of the methods to select the next 5% samples to train the model for each iteration
    - At each iteration, only newly pooled samples are used for training, and the previous iteration samples are not used.
    - We retrain the model with these new samples until there is a limit degradation and then check the accuracy after each iteration during retraining for each of these methods.
 
