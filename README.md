@@ -79,12 +79,3 @@ This file defines the architecture of the machine learning or deep learning mode
 
 ### 4. requirements.txt
 This file lists all the Python dependencies and libraries required to run the project. It ensures that anyone who clones the repository can install the exact versions of the dependencies needed to avoid compatibility issues.
-
-### 5. swin.py
-This file implements the Swin Transformer model, a type of Vision Transformer known for its hierarchical design and efficiency in handling computer vision tasks.
-
-### 6. vit-tiny.py
-This file implements the Vision Transformer (ViT) model, specifically the tiny variant, which is designed for image classification tasks with a smaller parameter count and faster training times.
-### 7. VOC2012-Expirements.py
-This file implements the VGG16 model(Pretrained on MS COCO Dataset) on VOC2012 dataset, which is designed for Object Detection tasks.
-
