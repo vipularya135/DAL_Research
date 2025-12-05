@@ -1,3 +1,4 @@
+# func_def.py (patched)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,20 +12,118 @@ from sklearn.metrics.pairwise import euclidean_distances
 import math
 from torchvision.datasets import VOCDetection
 import copy
+import time
+import csv
+import os
 
 seed = 42
 torch.manual_seed(seed)
 np.random.seed(seed)
-
-# Check if GPU is available and set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+class EWC(object):
+    def __init__(self, model, dataset, device='cpu', batch_size=64, samples=None, eps=1e-8, clamp_max=1e6):
+        """
+        Computes diagonal Fisher information and stores old params.
+        Added eps and clamp_max for numerical stability.
+        """
+        self.model = model
+        self.device = device
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.samples = samples
+        self.eps = eps
+        self.clamp_max = clamp_max
+
+        # store old parameters (detach copy)
+        self._params = {n: p.clone().detach().to(self.device) for n, p in model.named_parameters() if p.requires_grad}
+
+        # init precision (Fisher diagonal)
+        self._precision_matrices = {n: torch.zeros_like(p).to(self.device) for n, p in model.named_parameters() if p.requires_grad}
+
+        # compute fisher
+        self.compute_fisher()
+
+    def compute_fisher(self):
+        self.model.eval()
+        loader = data.DataLoader(self.dataset, batch_size=self.batch_size, shuffle=True)
+        count = 0
+
+        for batch_idx, batch in enumerate(loader):
+            if self.samples is not None and batch_idx >= self.samples:
+                break
+
+            inputs, targets = batch
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+
+            # zero grads
+            self.model.zero_grad()
+
+            outputs = self.model(inputs)  # raw logits
+            # use negative log-likelihood on predicted class
+            loss = F.nll_loss(F.log_softmax(outputs, dim=1), targets, reduction='mean')
+
+            # backward to get gradients
+            loss.backward()
+
+            valid = True
+            # accumulate squared grads (per-parameter)
+            for n, p in self.model.named_parameters():
+                if p.requires_grad:
+                    if p.grad is None:
+                        continue
+                    g = p.grad.data
+                    # guard against NaN/Inf in grads
+                    if torch.isnan(g).any() or torch.isinf(g).any():
+                        valid = False
+                        break
+
+            if not valid:
+                # skip this batch if gradients are invalid
+                self.model.zero_grad()
+                continue
+
+            # accumulate (normalize by batch size to keep scale consistent)
+            bs = float(inputs.size(0))
+            for n, p in self.model.named_parameters():
+                if p.requires_grad and p.grad is not None:
+                    self._precision_matrices[n] += (p.grad.data.clone().pow(2) / bs)
+
+            count += 1
+            self.model.zero_grad()
+
+        if count > 0:
+            for n in self._precision_matrices:
+                # average and clamp for numerical stability
+                mat = self._precision_matrices[n] / float(count)
+                mat = torch.nan_to_num(mat, nan=0.0, posinf=self.clamp_max, neginf=0.0)
+                # small epsilon
+                mat = mat + self.eps
+                # clamp upper bound
+                mat = torch.clamp(mat, max=self.clamp_max)
+                self._precision_matrices[n] = mat
+
+    def penalty(self, model):
+        """
+        Return scalar penalty = 0.5 * sum(F * (theta - theta_old)^2)
+        (0.5 factor matches common EWC formulation and helps scale)
+        """
+        loss = torch.tensor(0., device=self.device)
+        for n, p in model.named_parameters():
+            if p.requires_grad:
+                precision = self._precision_matrices.get(n, None)
+                old_param = self._params.get(n, None)
+                if precision is None or old_param is None:
+                    continue
+                diff = (p - old_param).pow(2)
+                _loss = precision * diff
+                loss = loss + _loss.sum()
+        # apply 1/2 factor
+        return 0.5 * loss
 
 def prepare_data(dataset_name):
     print('==> Preparing data..')
-    
     if dataset_name == 'cifar10':
-        # CIFAR-10 Normalization
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
@@ -37,9 +136,7 @@ def prepare_data(dataset_name):
         ])
         train_set = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform_train)
         test_set = datasets.CIFAR10(root='./data', train=False, download=True, transform=transform_test)
-    
     elif dataset_name == 'cifar100':
-        # CIFAR-100 Normalization
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
             transforms.RandomHorizontalFlip(),
@@ -52,9 +149,7 @@ def prepare_data(dataset_name):
         ])
         train_set = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
         test_set = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
-    
     elif dataset_name == 'svhn':
-        # SVHN Normalization
         transform_train = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.4377, 0.4438, 0.4728), (0.1980, 0.2010, 0.1970)),
@@ -69,16 +164,14 @@ def prepare_data(dataset_name):
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                std=[0.229, 0.224, 0.225])
+                                 std=[0.229, 0.224, 0.225])
         ])
         train_set = VOCDetection(root='./data', year='2012', image_set='train', download=True, transform=transform)
         test_set = VOCDetection(root='./data', year='2012', image_set='val', download=True, transform=transform)
-
-        
     else:
-        raise ValueError("Invalid dataset name. Choose from 'cifar10', 'cifar100', 'svhn', or 'voc2012'.")
+        raise ValueError("Invalid dataset name. Choose from 'cifar10','cifar100','svhn','voc2012'.")
 
-    torch.manual_seed(42)
+    torch.manual_seed(seed)
     initial_size = int(0.04 * len(train_set))
     remainder_size = len(train_set) - initial_size
     initial_train_set, remainder = torch.utils.data.random_split(train_set, [initial_size, remainder_size])
@@ -88,58 +181,74 @@ def prepare_data(dataset_name):
 
     return initial_train_set, remainder, test_set
 
-
-        
-def train_model(model, train_loader, epochs, learning_rate):
+# ----------------- Training / Testing -----------------
+def train_model(model, train_loader, epochs, learning_rate, ewc_obj=None, ewc_lambda=0.0):
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-     
+
+    epoch_losses = []
+    epoch_times = []
+
     for epoch in range(epochs):
         model.train()
         running_loss = 0.0
-        for i, data in enumerate(train_loader, 0):
-            inputs, labels = data
+        t0 = time.time()
+        for batch_data in train_loader:
+            inputs, labels = batch_data
             inputs, labels = inputs.to(device), labels.to(device)
 
             optimizer.zero_grad()
-
             outputs = model(inputs)
             loss = criterion(outputs, labels)
+
+            if ewc_obj is not None and ewc_lambda > 0.0:
+                pen = ewc_obj.penalty(model)
+                # guard against nan/inf penalty
+                if torch.isnan(pen) or torch.isinf(pen):
+                    pen = torch.tensor(0., device=device)
+                loss = loss + (ewc_lambda * pen)
+
             loss.backward()
+            # optional gradient clipping to avoid explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+
             optimizer.step()
 
-            running_loss += loss.item()
+            running_loss += float(loss.detach().cpu().item())
 
-        print(f'Epoch {epoch + 1}, Loss: {running_loss / len(train_loader)}')
-        
-        # Step the scheduler
+        t1 = time.time()
+        epoch_time = t1 - t0
+        avg_loss = running_loss / max(1, len(train_loader))
+
+        epoch_losses.append(avg_loss)
+        epoch_times.append(epoch_time)
+        print(f"Epoch {epoch+1}, Loss: {avg_loss:.6f}, Epoch Time: {epoch_time:.2f}s")
+
         scheduler.step()
-    
 
+    return epoch_losses, epoch_times
 
 def test_model(model, test_loader):
     model.eval()
     correct = 0
     total = 0
     with torch.no_grad():
-        for data in test_loader:
-            inputs, labels = data
+        for data_batch in test_loader:
+            inputs, labels = data_batch
             inputs, labels = inputs.to(device), labels.to(device)
             outputs = model(inputs)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
-
-    accuracy = correct / total
+    accuracy = correct / total if total > 0 else 0.0
     print(f'Test Accuracy: {accuracy * 100:.2f}%')
     return accuracy
 
 def calculate_cluster_centers(embeddings, num_clusters):
     kmeans = KMeans(n_clusters=num_clusters, random_state=0, n_init=10)
     cluster_labels = kmeans.fit_predict(embeddings)
-    cluster_centers = kmeans.cluster_centers_
-    return cluster_centers
+    return kmeans.cluster_centers_
 
 def get_most_diverse_samples(tsne_results, cluster_centers, num_diverse_samples):
     distances = euclidean_distances(tsne_results, cluster_centers)
@@ -148,53 +257,51 @@ def get_most_diverse_samples(tsne_results, cluster_centers, num_diverse_samples)
     diverse_indices = sorted_indices[:num_diverse_samples]
     return diverse_indices
 
-def extract_embeddings(model, test):
-    test_loader = data.DataLoader(test, batch_size=64, shuffle=False)
+def extract_embeddings(model, dataset):
+    test_loader = data.DataLoader(dataset, batch_size=64, shuffle=False)
     model.eval()
     embeddings = []
-    targets_list = []
     with torch.no_grad():
         for images, targets in test_loader:
-            images, targets = images.to(device), targets.to(device)
-            intermediate_features = model(images)
-            embeddings.extend(intermediate_features.view(intermediate_features.size(0), -1).tolist())
-            targets_list.append(targets)
+            images = images.to(device)
+            feats = model(images)
+            embeddings.extend(feats.view(feats.size(0), -1).cpu().tolist())
     return embeddings
 
 def least_confidence_images(model, test_dataset, k=None):
     test_loader = data.DataLoader(test_dataset, batch_size=64, shuffle=False)
     confidences = []
-    labels = []
     with torch.no_grad():
         for images, targets in test_loader:
-            images, targets = images.to(device), targets.to(device)
+            images = images.to(device)
             outputs = model(images)
             probs = F.softmax(outputs, dim=1)
             max_probs, _ = torch.max(probs, dim=1)
             confidences.extend(max_probs.cpu().tolist())
-            labels.extend(targets.cpu().tolist())
     confidences = torch.tensor(confidences)
     k = min(k, len(confidences)) if k is not None else len(confidences)
+    if k == 0:
+        return data.Subset(test_dataset, []), []
     _, indices = torch.topk(confidences, k, largest=False)
-    return data.Subset(test_dataset, indices), indices.tolist()  # Convert to list
+    return data.Subset(test_dataset, indices), indices.tolist()
 
 def high_confidence_images(model, test_dataset, k=None):
     test_loader = data.DataLoader(test_dataset, batch_size=64, shuffle=False)
     confidences = []
-    labels = []
     with torch.no_grad():
         for images, targets in test_loader:
-            images, targets = images.to(device), targets.to(device)
+            images = images.to(device)
             outputs = model(images)
             probs = F.softmax(outputs, dim=1)
             max_probs, _ = torch.max(probs, dim=1)
             confidences.extend(max_probs.cpu().tolist())
-            labels.extend(targets.cpu().tolist())
     confidences = torch.tensor(confidences)
     k = min(k, len(confidences)) if k is not None else len(confidences)
+    if k == 0:
+        return data.Subset(test_dataset, []), []
     _, indices = torch.topk(confidences, k, largest=True)
-    return data.Subset(test_dataset, indices), indices.tolist()  # Convert to list
-    
+    return data.Subset(test_dataset, indices), indices.tolist()
+
 def HC_diverse(embed_model, remainder, n=None):
     high_conf_images, high_conf_indices = high_confidence_images(embed_model, remainder, k=min(2*n, len(remainder)) if n else len(remainder))
     high_conf_embeddings = extract_embeddings(embed_model, high_conf_images)
@@ -218,35 +325,33 @@ def LC_diverse(embed_model, remainder, n=None):
     return diverse_images, [least_conf_indices[i] for i in diverse_indices]
 
 def LC_HC(model, remainder, n=None):
-    least_confident, least_confident_indices = least_confidence_images(model, remainder, k=n//2)
-    most_confident, most_confident_indices = high_confidence_images(model, remainder, k=n//2)
+    least_confident, least_confident_indices = least_confidence_images(model, remainder, k=(n//2) if n else 0)
+    most_confident, most_confident_indices = high_confidence_images(model, remainder, k=(n//2) if n else 0)
     combined_dataset = data.ConcatDataset([least_confident, most_confident])
-    combined_indices = least_confident_indices + most_confident_indices  # Now lists are concatenated
+    combined_indices = list(least_confident_indices) + list(most_confident_indices)
     return combined_dataset, combined_indices
 
 def LC_HC_diverse(embed_model, remainder, n, low_conf_ratio=0.5, high_conf_ratio=0.5):
-    assert low_conf_ratio + high_conf_ratio == 1.0, "Ratios must sum to 1.0"
+    assert abs(low_conf_ratio + high_conf_ratio - 1.0) < 1e-9, "Ratios must sum to 1.0"
 
     n_low = int(n * low_conf_ratio)
     n_high = int(n * high_conf_ratio)
 
-    # Process low confidence
     least_conf_images, least_conf_indices = least_confidence_images(embed_model, remainder, k=min(2*n_low, len(remainder)))
     least_conf_embeddings = extract_embeddings(embed_model, least_conf_images)
     least_conf_embeddings = np.array([np.array(e) for e in least_conf_embeddings])
     tsne = TSNE(n_components=2, perplexity=30, n_iter=300)
-    tsne_results = tsne.fit_transform(least_conf_embeddings)
-    cluster_centers = calculate_cluster_centers(tsne_results, 10)
-    diverse_low_indices = get_most_diverse_samples(tsne_results, cluster_centers, n_low)
+    tsne_results_low = tsne.fit_transform(least_conf_embeddings)
+    cluster_centers_low = calculate_cluster_centers(tsne_results_low, 10)
+    diverse_low_indices = get_most_diverse_samples(tsne_results_low, cluster_centers_low, n_low)
     diverse_least_conf_images = data.Subset(least_conf_images, diverse_low_indices)
 
-    # Process high confidence
     high_conf_images, high_conf_indices = high_confidence_images(embed_model, remainder, k=min(2*n_high, len(remainder)))
     high_conf_embeddings = extract_embeddings(embed_model, high_conf_images)
     high_conf_embeddings = np.array([np.array(e) for e in high_conf_embeddings])
-    tsne_results = tsne.fit_transform(high_conf_embeddings)
-    cluster_centers = calculate_cluster_centers(tsne_results, 10)
-    diverse_high_indices = get_most_diverse_samples(tsne_results, cluster_centers, n_high)
+    tsne_results_high = tsne.fit_transform(high_conf_embeddings)
+    cluster_centers_high = calculate_cluster_centers(tsne_results_high, 10)
+    diverse_high_indices = get_most_diverse_samples(tsne_results_high, cluster_centers_high, n_high)
     diverse_high_conf_images = data.Subset(high_conf_images, diverse_high_indices)
 
     combined_dataset = data.ConcatDataset([diverse_least_conf_images, diverse_high_conf_images])
@@ -254,233 +359,244 @@ def LC_HC_diverse(embed_model, remainder, n, low_conf_ratio=0.5, high_conf_ratio
 
     return combined_dataset, combined_indices
 
-# 5% of new remaining data added to each iteration
-# def train_until_empty(model, initial_train_set, remainder_set, test_set, epochs=1, max_iterations=15, batch_size=64, learning_rate=0.01, method=1):
-#     exp_acc = []
-    
-#     for iteration in range(max_iterations):
-#         print(f"Starting Iteration {iteration+1}")
-#         print(f"Remainder Size: {len(remainder_set)}")
-#         if len(remainder_set) == 0:
-#             print("Dataset empty. Stopping.")
-#             break
-                    
-#         n_samples = int(0.05 * len(remainder_set))
-#         n_samples = min(n_samples, len(remainder_set)) 
-
-#         if method == 1:
-#             train_data, used_indices = LC_HC(model, remainder_set, n=n_samples)
-#         elif method == 2:
-#             train_data, used_indices = LC_HC_diverse(model, remainder_set, n=n_samples)
-#         elif method == 3:
-#             train_data, used_indices = HC_diverse(model, remainder_set, n=n_samples)
-#         elif method == 4:
-#             train_data, used_indices = LC_diverse(model, remainder_set, n=n_samples)
-#         else:
-#             print("Invalid method.")
-#             return exp_acc
-        
-#         print(f"Selected samples: {len(train_data)}")
-#         print(f"Used indices: {len(used_indices)}")
-    
-#         initial_train_set = data.ConcatDataset([initial_train_set, train_data])
-        
-#         # Update remainder by excluding used indices
-#         used_indices_set = set(used_indices)
-#         remainder_indices = [i for i in range(len(remainder_set)) if i not in used_indices_set]
-#         remainder_set = data.Subset(remainder_set, remainder_indices)
-        
-#         print(f"\nIteration {iteration + 1}")
-#         print(f"Train Size: {len(initial_train_set)}, Remainder Size: {len(remainder_set)}")
-#         train_loader = data.DataLoader(initial_train_set, batch_size=batch_size, shuffle=True)
-#         train_model(model, train_loader, epochs=epochs, learning_rate=learning_rate)
-
-#         test_loader = data.DataLoader(test_set, batch_size=batch_size)
-#         accuracy = test_model(model, test_loader)
-#         exp_acc.append(accuracy)
-#         print(f"Iteration {iteration+1} Accuracy: {accuracy}")
-
-#     return exp_acc
-
 def train_until_empty(model, initial_train_set, remainder_set, test_set,
                       epochs=50, max_iterations=20, batch_size=32,
-                      learning_rate=0.01, method=1, run_tag='lcd'):
-    
+                      learning_rate=0.01, method=5, run_tag='ewc_vgg16_cifar10',
+                      ewc_lambda=1000.0, lambda_ewc=None, ewc_samples_for_fisher=50):
+    """
+    Modified version: Each iteration trains ONLY on the newly added samples.
+    First iteration: initial 4% data
+    Subsequent iterations: only new 5% data each time
+    """
+    # map alias if provided
+    if lambda_ewc is not None:
+        ewc_lambda = lambda_ewc
+
     import numpy as np
     from torch.utils import data
-    import csv
-    import os
 
     exp_acc = []
-
     original_dataset = remainder_set.dataset
     total_data_size = len(original_dataset)
 
-  
+    # Track which indices have been selected
     if hasattr(initial_train_set, 'indices'):
-        initial_indices = list(initial_train_set.indices)
+        all_selected_indices = set(initial_train_set.indices)
     else:
         raise ValueError("initial_train_set must be a Subset with indices.")
 
-    # remainder indices
-    if hasattr(remainder_set, 'indices'):
-        all_remainder_indices = list(remainder_set.indices)
-    else:
-        all_remainder_indices = list(range(len(original_dataset)))
-        all_remainder_indices = [i for i in all_remainder_indices if i not in initial_indices]
+    available_mask = np.ones(len(original_dataset), dtype=bool)
+    available_mask[list(all_selected_indices)] = False
 
-   
-    available_mask = np.zeros(len(original_dataset), dtype=bool)
-    available_mask[all_remainder_indices] = True
-
-    fixed_sample_size = int(0.05 * total_data_size)
-
+    fixed_sample_size = int(0.05 * total_data_size)  # 5% of total dataset (2500 for CIFAR10)
+    
+    # For first iteration, we already have 4% data in initial_train_set
+    # For subsequent iterations, we'll select new 5% data each time
 
     iter_csv = f"time_iter_log_{run_tag}.csv"
     epoch_csv = f"time_epoch_log_{run_tag}.csv"
+
     if not os.path.exists(iter_csv):
         with open(iter_csv, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['method','iteration','train_size_new_samples','remainder_size_after_selection','iteration_time_s','avg_epoch_time_s','total_epoch_time_s','avg_epoch_loss','test_acc'])
+            w.writerow(['method', 'iteration', 'train_size', 'remainder_size',
+                        'iteration_time_s', 'avg_epoch_time_s', 'total_epoch_time_s',
+                        'avg_epoch_loss', 'test_acc'])
     if not os.path.exists(epoch_csv):
         with open(epoch_csv, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['method','iteration','epoch','epoch_time_s','epoch_loss','trained_on']) # trained_on indicates 'initial' or 'new'
+            w.writerow(['method', 'iteration', 'epoch', 'epoch_time_s', 'epoch_loss'])
 
-    # ----------------- INITIAL TRAINING ON initial_train_set -----------------
-    print(">>> Initial training on initial labeled set only")
-    if len(initial_indices) > 0:
-        init_loader = data.DataLoader(initial_train_set, batch_size=batch_size, shuffle=True)
-        init_epoch_losses, init_epoch_times = train_model(model, init_loader, epochs=epochs, learning_rate=learning_rate)
-        test_loader = data.DataLoader(test_set, batch_size=batch_size)
-        initial_acc = test_model(model, test_loader)
-        print(f"Initial training done. Initial test accuracy: {initial_acc:.6f}")
-        with open(iter_csv, 'a', newline='') as f:
-            w = csv.writer(f)
-            w.writerow([f"method_{method}", 0, len(initial_indices), (available_mask.sum()),  sum(init_epoch_times)+0.0, np.mean(init_epoch_times) if len(init_epoch_times)>0 else 0.0, sum(init_epoch_times), (sum(init_epoch_losses)/len(init_epoch_losses) if len(init_epoch_losses)>0 else 0.0), f"{initial_acc:.6f}"])
-        with open(epoch_csv, 'a', newline='') as f:
-            w = csv.writer(f)
-            for ei, (et, el) in enumerate(zip(init_epoch_times, init_epoch_losses), start=1):
-                w.writerow([f"method_{method}", 0, ei, f"{et:.4f}", f"{el:.6f}", "initial"])
+    # Initial training on 4% data
+    print(f"\n=== Initial Training (Iteration 0) ===")
+    print(f"Training on initial 4% data: {len(initial_train_set)} samples")
+    
+    # Store initial model state
+    initial_model_state = copy.deepcopy(model.state_dict())
+    
+    # First iteration: Train on initial 4% data
+    iter_start = time.time()
+    
+    # Create train loader from initial dataset only
+    train_loader = data.DataLoader(initial_train_set, batch_size=batch_size, shuffle=True)
+    
+    # For EWC, we need to compute Fisher on the current training data
+    ewc_obj = None
+    if method == 5:
+        ewc_obj = EWC(model, initial_train_set, device=device, batch_size=64, 
+                     samples=ewc_samples_for_fisher)
+        epoch_losses, epoch_times = train_model(model, train_loader, epochs=epochs, 
+                                               learning_rate=learning_rate,
+                                               ewc_obj=ewc_obj, ewc_lambda=ewc_lambda)
     else:
-        print("No initial labeled indices provided; skipping initial training.")
-
-    # ----------------- training only on NEW samples each iteration -----------------
-    for iteration in range(1, max_iterations+1):
+        epoch_losses, epoch_times = train_model(model, train_loader, epochs=epochs, 
+                                               learning_rate=learning_rate,
+                                               ewc_obj=None, ewc_lambda=0.0)
+    
+    # Test after initial training
+    test_loader = data.DataLoader(test_set, batch_size=batch_size)
+    accuracy = test_model(model, test_loader)
+    
+    iter_end = time.time()
+    iteration_time = iter_end - iter_start
+    total_epoch_time = sum(epoch_times) if len(epoch_times) > 0 else 0.0
+    avg_epoch_time = (total_epoch_time / len(epoch_times)) if len(epoch_times) > 0 else 0.0
+    avg_epoch_loss = (sum(epoch_losses) / len(epoch_losses)) if len(epoch_losses) > 0 else 0.0
+    
+    # Log initial iteration
+    with open(iter_csv, 'a', newline='') as f:
+        w = csv.writer(f)
+        w.writerow([
+            f"method_{method}",
+            0,
+            len(initial_train_set),
+            len(remainder_set),
+            f"{iteration_time:.4f}",
+            f"{avg_epoch_time:.4f}",
+            f"{total_epoch_time:.4f}",
+            f"{avg_epoch_loss:.6f}",
+            f"{accuracy:.6f}"
+        ])
+    
+    with open(epoch_csv, 'a', newline='') as f:
+        w = csv.writer(f)
+        for i, (et, el) in enumerate(zip(epoch_times, epoch_losses)):
+            w.writerow([
+                f"method_{method}",
+                0,
+                i + 1,
+                f"{et:.4f}",
+                f"{el:.6f}"
+            ])
+    
+    exp_acc.append(accuracy)
+    print(f"Initial Iteration Accuracy: {accuracy}")
+    
+    # Now start the iterative process
+    for iteration in range(1, max_iterations + 1):
         current_remainder_indices = np.where(available_mask)[0]
         if len(current_remainder_indices) == 0:
             print("Dataset empty. Stopping.")
             break
-
+        
         current_remainder = data.Subset(original_dataset, current_remainder_indices)
-        print(f"\nStarting Iteration {iteration}")
-        print(f"Remainder Size (before selection): {len(current_remainder)}")
-
-        # determine selection
+        print(f"\n=== Iteration {iteration} ===")
+        print(f"Remainder Size: {len(current_remainder)}")
+        
+        # Check if enough data remains
         if len(current_remainder) <= fixed_sample_size:
-            print("Less than fixed sample size left. Taking all remaining samples.")
+            print(f"Less than {fixed_sample_size} samples left. Taking all remaining samples.")
             relative_indices = list(range(len(current_remainder)))
-            absolute_selected = [current_remainder_indices[i] for i in relative_indices]
-            samples_to_add = data.Subset(original_dataset, absolute_selected)
+            new_samples = data.Subset(current_remainder.dataset,
+                                     [int(current_remainder_indices[i]) for i in relative_indices])
         else:
+            # Select new samples based on the method
             if method == 1:
-                train_data_subset, relative_indices = LC_HC(model, current_remainder, n=fixed_sample_size)
+                new_samples, relative_indices = LC_HC(model, current_remainder, n=fixed_sample_size)
             elif method == 2:
-                train_data_subset, relative_indices = LC_HC_diverse(model, current_remainder, n=fixed_sample_size)
+                new_samples, relative_indices = LC_HC_diverse(model, current_remainder, n=fixed_sample_size)
             elif method == 3:
-                train_data_subset, relative_indices = HC_diverse(model, current_remainder, n=fixed_sample_size)
+                new_samples, relative_indices = HC_diverse(model, current_remainder, n=fixed_sample_size)
             elif method == 4:
-                train_data_subset, relative_indices = LC_diverse(model, current_remainder, n=fixed_sample_size)
+                new_samples, relative_indices = LC_diverse(model, current_remainder, n=fixed_sample_size)
+            elif method == 5:
+                new_samples, relative_indices = LC_HC(model, current_remainder, n=fixed_sample_size)
             else:
                 print("Invalid method.")
                 return exp_acc
-
-            absolute_selected = [current_remainder_indices[i] for i in relative_indices]
-            samples_to_add = data.Subset(original_dataset, absolute_selected)
-
-       
-        available_mask[absolute_selected] = False
-
-       
-        new_train_size = len(absolute_selected)
-        remainder_after = int(available_mask.sum())
-
-        print(f"New samples selected this iteration: {new_train_size}")
-        print(f"Remainder Size (after selection): {remainder_after}")
-
-        # ------------------ TIMING: train ONLY on samples_to_add ------------------------
+        
+        absolute_indices = [int(current_remainder_indices[i]) for i in relative_indices]
+        
+        # Update tracking
+        available_mask[absolute_indices] = False
+        all_selected_indices.update(absolute_indices)
+        
+        print(f"New samples selected: {len(new_samples)}")
+        print(f"Total selected samples so far: {len(all_selected_indices)}")
+        
+        # For EWC: we need to compute Fisher on ALL previously seen data
+        if method == 5:
+            # Create dataset of all seen data for Fisher computation
+            consolidated_dataset = data.Subset(original_dataset, list(all_selected_indices))
+            ewc_obj = EWC(model, consolidated_dataset, device=device, 
+                         batch_size=64, samples=ewc_samples_for_fisher)
+        
+        # TIMING start for this iteration
         iter_start = time.time()
-
-        if new_train_size == 0:
-            print("No new samples selected this iteration, skipping training.")
-            test_loader = data.DataLoader(test_set, batch_size=batch_size)
-            acc = test_model(model, test_loader)
-            exp_acc.append(acc)
-            with open(iter_csv, 'a', newline='') as f:
-                w = csv.writer(f)
-                w.writerow([f"method_{method}", iteration, new_train_size, remainder_after, 0.0, 0.0, 0.0, 0.0, f"{acc:.6f}"])
-            continue
-
-        train_loader_new = data.DataLoader(samples_to_add, batch_size=batch_size, shuffle=True)
-
-        epoch_losses, epoch_times = train_model(model, train_loader_new, epochs=epochs, learning_rate=learning_rate)
-
-        # test
+        
+        # Train ONLY on new samples for this iteration
+        train_loader = data.DataLoader(new_samples, batch_size=batch_size, shuffle=True)
+        
+        if method == 5:
+            epoch_losses, epoch_times = train_model(model, train_loader, epochs=epochs, 
+                                                   learning_rate=learning_rate,
+                                                   ewc_obj=ewc_obj, ewc_lambda=ewc_lambda)
+        else:
+            epoch_losses, epoch_times = train_model(model, train_loader, epochs=epochs, 
+                                                   learning_rate=learning_rate,
+                                                   ewc_obj=None, ewc_lambda=0.0)
+        
+        # Test after training
         test_loader = data.DataLoader(test_set, batch_size=batch_size)
         accuracy = test_model(model, test_loader)
-
+        
         iter_end = time.time()
-
         iteration_time = iter_end - iter_start
-        total_epoch_time = sum(epoch_times)
-        avg_epoch_time = total_epoch_time / len(epoch_times) if len(epoch_times)>0 else 0.0
-        avg_epoch_loss = sum(epoch_losses) / len(epoch_losses) if len(epoch_losses)>0 else 0.0
-
-        # Write iteration-level row
+        total_epoch_time = sum(epoch_times) if len(epoch_times) > 0 else 0.0
+        avg_epoch_time = (total_epoch_time / len(epoch_times)) if len(epoch_times) > 0 else 0.0
+        avg_epoch_loss = (sum(epoch_losses) / len(epoch_losses)) if len(epoch_losses) > 0 else 0.0
+        
+        # Log this iteration
         with open(iter_csv, 'a', newline='') as f:
             w = csv.writer(f)
-            w.writerow([f"method_{method}", iteration, new_train_size, remainder_after, f"{iteration_time:.4f}", f"{avg_epoch_time:.4f}", f"{total_epoch_time:.4f}", f"{avg_epoch_loss:.6f}", f"{accuracy:.6f}"])
-
-        # Write epoch-level rows (trained_on='new'):
+            w.writerow([
+                f"method_{method}",
+                iteration,
+                len(new_samples),  # Only train on new samples
+                len(current_remainder) - len(absolute_indices),
+                f"{iteration_time:.4f}",
+                f"{avg_epoch_time:.4f}",
+                f"{total_epoch_time:.4f}",
+                f"{avg_epoch_loss:.6f}",
+                f"{accuracy:.6f}"
+            ])
+        
         with open(epoch_csv, 'a', newline='') as f:
             w = csv.writer(f)
-            for ei, (et, el) in enumerate(zip(epoch_times, epoch_losses), start=1):
-                w.writerow([f"method_{method}", iteration, ei, f"{et:.4f}", f"{el:.6f}", "new"])
-
+            for i, (et, el) in enumerate(zip(epoch_times, epoch_losses)):
+                w.writerow([
+                    f"method_{method}",
+                    iteration,
+                    i + 1,
+                    f"{et:.4f}",
+                    f"{el:.6f}"
+                ])
+        
         exp_acc.append(accuracy)
         print(f"Iteration {iteration} Accuracy: {accuracy}")
-
+    
     return exp_acc
-                          
-def run_all_methods(model, initial_train_set, remainder, test_set):
-    methods = [1, 2, 3, 4]
-    results = {}
 
-    # Save initial model state
+def run_all_methods(model, initial_train_set, remainder, test_set):
+    methods = [1, 2, 3, 4]  # keep 1..4 as before; EWC (5) can be called explicitly from main
+    results = {}
     initial_model_state = copy.deepcopy(model.state_dict())
 
     for method in methods:
         print(f"\nStarting training with method {method}")
-        
-        # Reset model to initial state
         model.load_state_dict(initial_model_state)
-        
-        # Create deep copies of datasets
         initial_train_set_copy = copy.deepcopy(initial_train_set)
         remainder_copy = copy.deepcopy(remainder)
-        
-        # Initial training
+
         train_loader = data.DataLoader(initial_train_set_copy, batch_size=32, shuffle=True)
         train_model(model, train_loader, epochs=1, learning_rate=0.01)
-        
-        # Initial testing
+
         test_loader = data.DataLoader(test_set, batch_size=64)
         initial_accuracy = test_model(model, test_loader)
         print(f"Initial accuracy for method {method}: {initial_accuracy}")
-        
-        # Run the active learning iterations
-        exp_acc = train_until_empty(model, initial_train_set_copy, remainder_copy, test_set, 
-                                  max_iterations=20, batch_size=32, learning_rate=0.01, method=method)
+
+        exp_acc = train_until_empty(model, initial_train_set_copy, remainder_copy, test_set,
+                                    max_iterations=20, batch_size=32, learning_rate=0.01, method=method)
         results[f"method_{method}"] = exp_acc
 
     return results
