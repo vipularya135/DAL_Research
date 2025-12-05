@@ -1,7 +1,5 @@
 # main.py
 from models import *
-from swin import *
-from vit_tiny import *
 from func_def import prepare_data, train_until_empty
 
 import torch
